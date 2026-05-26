@@ -1,1 +1,550 @@
-# CloudFormation template - in progress
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Secure, Highly Available Multi-AZ VPC with public and private subnets,
+  AZ-aligned NAT Gateways, Apache web servers, and EC2 instances managed
+  exclusively via AWS Systems Manager Session Manager.
+  Author: Bonheur Mahoro
+  Lab: Securely Deploying Resources in a VPC Using CloudFormation
+
+# ==============================================================================
+# PARAMETERS
+# Customisable values you can override at deploy time in the AWS Console.
+# ==============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: VPCLab
+    Description: >
+      A prefix applied to every resource Name tag and export.
+      Change this if you want to deploy multiple stacks side-by-side.
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+    Description: EC2 instance type for all four servers.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: >
+      Automatically resolves to the latest Amazon Linux 2 AMI in the region
+      you deploy to. You do not need to change this value.
+
+# ==============================================================================
+# RESOURCES
+# Every AWS resource we create is defined here.
+# CloudFormation automatically determines the creation order based on
+# the !Ref / !GetAtt dependencies between resources.
+# ==============================================================================
+Resources:
+
+  # ============================================================================
+  # 1. VPC
+  # The isolated private network that contains everything else.
+  # CIDR 10.0.0.0/16 gives us 65,536 IP addresses to work with.
+  # DNS support and hostnames are enabled so instances can resolve each other.
+  # ============================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-VPC"
+
+  # ============================================================================
+  # 2. SUBNETS
+  # Four subnets spread across two Availability Zones.
+  #   Public subnets  → instances get a public IP automatically
+  #   Private subnets → no public IP; outbound internet goes through NAT
+  #
+  # !Select [0, !GetAZs ''] picks the first AZ in the current region  (e.g. us-east-1a)
+  # !Select [1, !GetAZs ''] picks the second AZ                       (e.g. us-east-1b)
+  # This keeps the template region-agnostic — no hardcoded AZ names.
+  # ============================================================================
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true   # EC2 instances here get a public IP at launch
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicSubnet-AZ1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicSubnet-AZ2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false  # No public IP — private instances stay private
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateSubnet-AZ1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateSubnet-AZ2"
+
+  # ============================================================================
+  # 3. INTERNET GATEWAY (IGW)
+  # The single entry/exit point between the VPC and the public internet.
+  # Must be attached to the VPC before any public routing can work.
+  # Only one IGW is needed per VPC regardless of how many AZs you use.
+  # ============================================================================
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-IGW"
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ============================================================================
+  # 4. ELASTIC IPs FOR NAT GATEWAYS
+  # Each NAT Gateway needs a static public IP address (Elastic IP).
+  # DependsOn: IGWAttachment ensures the IGW is attached first —
+  # AWS requires this before EIPs in a VPC can be used for NAT.
+  # ============================================================================
+  NATGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NAT1-EIP"
+
+  NATGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NAT2-EIP"
+
+  # ============================================================================
+  # 5. NAT GATEWAYS
+  # Two NAT Gateways — one in each public subnet (one per AZ).
+  # This is the key to high availability:
+  #   - PrivateSubnet1 (AZ1) routes outbound traffic through NATGateway1 (AZ1)
+  #   - PrivateSubnet2 (AZ2) routes outbound traffic through NATGateway2 (AZ2)
+  # If AZ1 fails, AZ2's private instances still have outbound internet access
+  # through their own NAT Gateway. No cross-AZ dependency.
+  # ============================================================================
+  NATGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1   # Must live in a PUBLIC subnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NATGateway-AZ1"
+
+  NATGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-NATGateway-AZ2"
+
+  # ============================================================================
+  # 6. ROUTE TABLES
+  # Route tables define where network traffic is sent.
+  #
+  # Public Route Table (shared by both public subnets):
+  #   All internet-bound traffic (0.0.0.0/0) → Internet Gateway
+  #
+  # Private Route Table AZ1 (for PrivateSubnet1 only):
+  #   All internet-bound traffic → NATGateway1 (same AZ)
+  #
+  # Private Route Table AZ2 (for PrivateSubnet2 only):
+  #   All internet-bound traffic → NATGateway2 (same AZ)
+  #
+  # Each subnet is associated to exactly one route table.
+  # ============================================================================
+
+  # --- Public Route Table ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicRouteTable"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment   # IGW must be attached before adding this route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- Private Route Table AZ1 ---
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateRouteTable-AZ1"
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway1   # AZ1 private traffic → AZ1 NAT Gateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  # --- Private Route Table AZ2 ---
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateRouteTable-AZ2"
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway2   # AZ2 private traffic → AZ2 NAT Gateway
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ============================================================================
+  # 7. IAM ROLE & INSTANCE PROFILE FOR SESSION MANAGER
+  # EC2 instances need an IAM Role to communicate with AWS Systems Manager.
+  # The role trusts ec2.amazonaws.com (allows EC2 to assume it).
+  # AmazonSSMManagedInstanceCore grants the minimum permissions SSM needs:
+  #   - Register instance with SSM
+  #   - Open a Session Manager terminal session
+  #   - Send/receive commands
+  # No SSH keys or open ports required — all access is through SSM.
+  # The InstanceProfile is the container that lets EC2 wear this IAM Role.
+  # ============================================================================
+  SSMInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-SSMInstanceRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-SSMInstanceRole"
+
+  SSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-SSMInstanceProfile"
+      Roles:
+        - !Ref SSMInstanceRole
+
+  # ============================================================================
+  # 8. SECURITY GROUPS
+  # Firewalls attached directly to EC2 instances.
+  # Least-privilege principle: only open what is strictly necessary.
+  #
+  # WebServerSG (public instances):
+  #   Inbound  → TCP 80 (HTTP) from anywhere (0.0.0.0/0)
+  #   Inbound  → ICMP (ping) from within the VPC only (10.0.0.0/16)
+  #   Outbound → all traffic allowed (needed for yum updates, SSM, etc.)
+  #   NO inbound SSH (port 22) — Session Manager replaces SSH entirely.
+  #
+  # AppServerSG (private instances):
+  #   Inbound  → ICMP (ping) from within the VPC only — for validation
+  #   Outbound → all traffic allowed (needed for NAT-routed updates + SSM)
+  #   NO inbound SSH. NO inbound HTTP.
+  # ============================================================================
+  WebServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-WebServerSG"
+      GroupDescription: Allow HTTP from internet and ICMP from within VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/16
+          Description: ICMP ping from within the VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic allowed
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-WebServerSG"
+
+  AppServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-AppServerSG"
+      GroupDescription: Allow ICMP from within VPC only for private app servers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/16
+          Description: ICMP ping from within the VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic allowed (routes through NAT Gateway)
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-AppServerSG"
+
+  # ============================================================================
+  # 9. EC2 INSTANCES
+  # Four instances total — 2 public (web tier), 2 private (app tier).
+  # All use the latest Amazon Linux 2 AMI resolved via the parameter above.
+  # All are assigned the SSMInstanceProfile so Session Manager can connect.
+  #
+  # Public instances have UserData — a shell script that runs at first boot:
+  #   1. Updates all packages
+  #   2. Installs Apache HTTP Server (httpd)
+  #   3. Starts and enables Apache (survives reboots)
+  #   4. Writes a simple HTML page to /var/www/html/index.html
+  #
+  # Private instances have no UserData — they are app-tier placeholders.
+  # ============================================================================
+
+  # --- Web Server 1 (Public, AZ1) ---
+  WebServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref WebServerSG
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update system packages
+          yum update -y
+          # Install Apache web server
+          yum install -y httpd
+          # Start Apache and enable it to start on every reboot
+          systemctl start httpd
+          systemctl enable httpd
+          # Write the HTML page served to visitors
+          cat <<'EOF' > /var/www/html/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <title>VPC Lab - Web Server 1</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center;
+                     padding: 60px; background-color: #f0f4f8; color: #1a202c; }
+              h1   { font-size: 2.5rem; color: #2b6cb0; }
+              h2   { font-size: 1.4rem; color: #4a5568; }
+              .badge { display: inline-block; margin-top: 20px; padding: 8px 20px;
+                       background: #ebf8ff; border: 1px solid #bee3f8;
+                       border-radius: 20px; font-size: 0.9rem; color: #2c5282; }
+            </style>
+          </head>
+          <body>
+            <h1>Bonheur Mahoro</h1>
+            <h2>Securely Deploying Resources in a VPC Using CloudFormation</h2>
+            <div class="badge">Web Server 1 &nbsp;|&nbsp; Public Subnet &nbsp;|&nbsp; AZ1</div>
+          </body>
+          </html>
+          EOF
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-WebServer1-AZ1"
+
+  # --- Web Server 2 (Public, AZ2) ---
+  WebServer2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroupIds:
+        - !Ref WebServerSG
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          cat <<'EOF' > /var/www/html/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <title>VPC Lab - Web Server 2</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center;
+                     padding: 60px; background-color: #f0f4f8; color: #1a202c; }
+              h1   { font-size: 2.5rem; color: #276749; }
+              h2   { font-size: 1.4rem; color: #4a5568; }
+              .badge { display: inline-block; margin-top: 20px; padding: 8px 20px;
+                       background: #f0fff4; border: 1px solid #9ae6b4;
+                       border-radius: 20px; font-size: 0.9rem; color: #22543d; }
+            </style>
+          </head>
+          <body>
+            <h1>Bonheur Mahoro</h1>
+            <h2>Securely Deploying Resources in a VPC Using CloudFormation</h2>
+            <div class="badge">Web Server 2 &nbsp;|&nbsp; Public Subnet &nbsp;|&nbsp; AZ2</div>
+          </body>
+          </html>
+          EOF
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-WebServer2-AZ2"
+
+  # --- App Server 1 (Private, AZ1) ---
+  AppServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref AppServerSG
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      # No UserData — private app tier, no web server needed
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-AppServer1-AZ1"
+
+  # --- App Server 2 (Private, AZ2) ---
+  AppServer2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref AppServerSG
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-AppServer2-AZ2"
+
+# ==============================================================================
+# OUTPUTS
+# Values CloudFormation exposes after the stack is created.
+# Visible in the AWS Console under CloudFormation → your stack → Outputs tab.
+# Use these to quickly find your instance IPs without digging through EC2.
+# ==============================================================================
+Outputs:
+
+  VPCId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+
+  PublicSubnet1Id:
+    Description: Public Subnet AZ1 ID
+    Value: !Ref PublicSubnet1
+
+  PublicSubnet2Id:
+    Description: Public Subnet AZ2 ID
+    Value: !Ref PublicSubnet2
+
+  PrivateSubnet1Id:
+    Description: Private Subnet AZ1 ID
+    Value: !Ref PrivateSubnet1
+
+  PrivateSubnet2Id:
+    Description: Private Subnet AZ2 ID
+    Value: !Ref PrivateSubnet2
+
+  WebServer1PublicIP:
+    Description: Public IP of Web Server 1 (AZ1) — open this in your browser
+    Value: !GetAtt WebServer1.PublicIp
+
+  WebServer2PublicIP:
+    Description: Public IP of Web Server 2 (AZ2) — open this in your browser
+    Value: !GetAtt WebServer2.PublicIp
+
+  AppServer1PrivateIP:
+    Description: Private IP of App Server 1 (AZ1) — use for ping validation
+    Value: !GetAtt AppServer1.PrivateIp
+
+  AppServer2PrivateIP:
+    Description: Private IP of App Server 2 (AZ2) — use for ping validation
+    Value: !GetAtt AppServer2.PrivateIp
