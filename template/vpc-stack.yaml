@@ -6,10 +6,8 @@ Description: >
   Author: Bonheur Mahoro
   Lab: Securely Deploying Resources in a VPC Using CloudFormation
 
-# ==============================================================================
 # PARAMETERS
 # Customisable values you can override at deploy time in the AWS Console.
-# ==============================================================================
 Parameters:
 
   EnvironmentName:
@@ -35,20 +33,16 @@ Parameters:
       Automatically resolves to the latest Amazon Linux 2 AMI in the region
       you deploy to. You do not need to change this value.
 
-# ==============================================================================
 # RESOURCES
 # Every AWS resource we create is defined here.
 # CloudFormation automatically determines the creation order based on
 # the !Ref / !GetAtt dependencies between resources.
-# ==============================================================================
 Resources:
 
-  # ============================================================================
   # 1. VPC
   # The isolated private network that contains everything else.
   # CIDR 10.0.0.0/16 gives us 65,536 IP addresses to work with.
   # DNS support and hostnames are enabled so instances can resolve each other.
-  # ============================================================================
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -59,7 +53,6 @@ Resources:
         - Key: Name
           Value: !Sub "${EnvironmentName}-VPC"
 
-  # ============================================================================
   # 2. SUBNETS
   # Four subnets spread across two Availability Zones.
   #   Public subnets  → instances get a public IP automatically
@@ -68,7 +61,6 @@ Resources:
   # !Select [0, !GetAZs ''] picks the first AZ in the current region  (e.g. us-east-1a)
   # !Select [1, !GetAZs ''] picks the second AZ                       (e.g. us-east-1b)
   # This keeps the template region-agnostic — no hardcoded AZ names.
-  # ============================================================================
 
   PublicSubnet1:
     Type: AWS::EC2::Subnet
@@ -114,12 +106,10 @@ Resources:
         - Key: Name
           Value: !Sub "${EnvironmentName}-PrivateSubnet-AZ2"
 
-  # ============================================================================
   # 3. INTERNET GATEWAY (IGW)
   # The single entry/exit point between the VPC and the public internet.
   # Must be attached to the VPC before any public routing can work.
   # Only one IGW is needed per VPC regardless of how many AZs you use.
-  # ============================================================================
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
@@ -133,12 +123,10 @@ Resources:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
-  # ============================================================================
   # 4. ELASTIC IPs FOR NAT GATEWAYS
   # Each NAT Gateway needs a static public IP address (Elastic IP).
   # DependsOn: IGWAttachment ensures the IGW is attached first —
   # AWS requires this before EIPs in a VPC can be used for NAT.
-  # ============================================================================
   NATGateway1EIP:
     Type: AWS::EC2::EIP
     DependsOn: IGWAttachment
@@ -157,7 +145,6 @@ Resources:
         - Key: Name
           Value: !Sub "${EnvironmentName}-NAT2-EIP"
 
-  # ============================================================================
   # 5. NAT GATEWAYS
   # Two NAT Gateways — one in each public subnet (one per AZ).
   # This is the key to high availability:
@@ -165,7 +152,6 @@ Resources:
   #   - PrivateSubnet2 (AZ2) routes outbound traffic through NATGateway2 (AZ2)
   # If AZ1 fails, AZ2's private instances still have outbound internet access
   # through their own NAT Gateway. No cross-AZ dependency.
-  # ============================================================================
   NATGateway1:
     Type: AWS::EC2::NatGateway
     Properties:
@@ -184,7 +170,6 @@ Resources:
         - Key: Name
           Value: !Sub "${EnvironmentName}-NATGateway-AZ2"
 
-  # ============================================================================
   # 6. ROUTE TABLES
   # Route tables define where network traffic is sent.
   #
@@ -198,7 +183,6 @@ Resources:
   #   All internet-bound traffic → NATGateway2 (same AZ)
   #
   # Each subnet is associated to exactly one route table.
-  # ============================================================================
 
   # --- Public Route Table ---
   PublicRouteTable:
@@ -273,7 +257,6 @@ Resources:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable2
 
-  # ============================================================================
   # 7. IAM ROLE & INSTANCE PROFILE FOR SESSION MANAGER
   # EC2 instances need an IAM Role to communicate with AWS Systems Manager.
   # The role trusts ec2.amazonaws.com (allows EC2 to assume it).
@@ -283,7 +266,6 @@ Resources:
   #   - Send/receive commands
   # No SSH keys or open ports required — all access is through SSM.
   # The InstanceProfile is the container that lets EC2 wear this IAM Role.
-  # ============================================================================
   SSMInstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -308,7 +290,6 @@ Resources:
       Roles:
         - !Ref SSMInstanceRole
 
-  # ============================================================================
   # 8. SECURITY GROUPS
   # Firewalls attached directly to EC2 instances.
   # Least-privilege principle: only open what is strictly necessary.
@@ -323,7 +304,6 @@ Resources:
   #   Inbound  → ICMP (ping) from within the VPC only — for validation
   #   Outbound → all traffic allowed (needed for NAT-routed updates + SSM)
   #   NO inbound SSH. NO inbound HTTP.
-  # ============================================================================
   WebServerSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -369,7 +349,6 @@ Resources:
         - Key: Name
           Value: !Sub "${EnvironmentName}-AppServerSG"
 
-  # ============================================================================
   # 9. EC2 INSTANCES
   # Four instances total — 2 public (web tier), 2 private (app tier).
   # All use the latest Amazon Linux 2 AMI resolved via the parameter above.
@@ -382,7 +361,6 @@ Resources:
   #   4. Writes a simple HTML page to /var/www/html/index.html
   #
   # Private instances have no UserData — they are app-tier placeholders.
-  # ============================================================================
 
   # --- Web Server 1 (Public, AZ1) ---
   WebServer1:
@@ -505,12 +483,10 @@ Resources:
         - Key: Name
           Value: !Sub "${EnvironmentName}-AppServer2-AZ2"
 
-# ==============================================================================
 # OUTPUTS
 # Values CloudFormation exposes after the stack is created.
 # Visible in the AWS Console under CloudFormation → your stack → Outputs tab.
 # Use these to quickly find your instance IPs without digging through EC2.
-# ==============================================================================
 Outputs:
 
   VPCId:
