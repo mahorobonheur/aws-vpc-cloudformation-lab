@@ -1,3 +1,4 @@
-template-file-path: template/vpc-lab.yaml
+# CloudFormation Git sync deployment file
+template-file-path: template/vpc-stack.yaml
 parameters: {}
 tags: {}
