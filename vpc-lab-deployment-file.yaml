@@ -1,0 +1,6 @@
+template-file-path: template/vpc-stack.yaml
+parameters:
+  InstanceType: t2.micro
+  EnvironmentName: VPCLab
+  LatestAmiId: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+tags: {}
