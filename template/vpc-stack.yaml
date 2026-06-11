@@ -106,6 +106,17 @@ Resources:
         - Key: Name
           Value: !Sub "${EnvironmentName}-PrivateSubnet-AZ2"
 
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PrivateSubnet-AZ3"
+
   # 3. INTERNET GATEWAY (IGW)
   # The single entry/exit point between the VPC and the public internet.
   # Must be attached to the VPC before any public routing can work.
